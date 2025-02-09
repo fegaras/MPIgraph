@@ -26,6 +26,9 @@ void bcast_data ( char* &buffer, size_t len );
 // receive data from any MPI executor - return the executor rank
 int receive_data ( char* &buffer, const size_t buffer_size );
 
+// or-together all values (blocking)
+bool or_all ( bool b );
+
 // barrier synchronization
 void barrier ();
 

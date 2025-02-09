@@ -56,6 +56,14 @@ int receive_data ( char* &buffer, const size_t buffer_size ) {
   return status.MPI_SOURCE;
 }
 
+// or-together all values (blocking)
+bool or_all ( bool b ) {
+  int in[1] = { ( b ? 1 : 0 ) };
+  int ret[1];
+  MPI_Allreduce(in,ret,1,MPI_INT,MPI_LOR,comm);
+  return ret[0] == 1;
+}
+
 // barrier synchronization
 void barrier () {
   MPI_Barrier(comm);

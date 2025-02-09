@@ -17,9 +17,7 @@
 #include <functional>
 #include <set>
 #include <random>
-#include <iostream>
 #include <cassert>
-#include "omp.h"
 
 #include "graph.h"
 #include "comm.h"
@@ -27,13 +25,14 @@
 using namespace std;
 
 class PageRank: public GraphPartition<int,float,char,float> {
+  int num_of_vertices;
 public:
-  PageRank (): GraphPartition() {
-    max_iterations = 10;
+  PageRank ( int num_of_vertices ): GraphPartition() {
+    this->num_of_vertices = num_of_vertices;
   }
 
   float initialize ( int id ) {
-    return 0.1;
+    return 1.0/num_of_vertices;
   }
 
   float zero = 0.0;
@@ -47,15 +46,27 @@ public:
   }
 
   float send ( float new_val, char edge_val, int degree ) {
-    return new_val/degree;
+    return 0.15/num_of_vertices+0.85*new_val/degree;
   }
 
   bool activate ( float new_val, float old_val ) {
-    return true;
+    return abs(new_val-old_val)/new_val >= 0.1;
   }
 };
 
 PageRank* pagerank;
+
+void ae ( int from, int to ) {
+  pagerank->add_edge(from,to,0);
+}
+
+void test_graph () {
+  // https://en.wikipedia.org/wiki/PageRank#/media/File:PageRanks-Example.svg
+  pagerank->add_sink(1);
+  ae(2,1); ae(2,3); ae(4,2); ae(4,3); ae(4,10);
+  ae(5,3); ae(5,4); ae(6,3); ae(6,4); ae(7,3); ae(7,4);
+  ae(8,4); ae(9,4); ae(10,4); ae(10,3); ae(0,3); ae(3,0);
+}
 
 const int max_degree = 100;
 
@@ -95,16 +106,16 @@ int main ( int argc, char* argv[] ) {
   int size = (argc > 1) ? atoi(argv[1]) : 1000;
   start_comm(argc,argv);
   assert(size > 1);
-  pagerank = new PageRank();
+  int max_iterations = (argc > 2) ? atoi(argv[2]) : 1;
+  pagerank = new PageRank(size);
+  // test_graph();
   generate_random_graph_partition(executor_rank*ceil(size/num_of_executors),
-                                  (executor_rank == num_of_executors-1)
-                                  ? size - ceil(size/num_of_executors)*(num_of_executors-1)
-                                  : ceil(size/num_of_executors),
-                                  size);
+           (executor_rank == num_of_executors-1)
+            ? size - ceil(size/num_of_executors)*(num_of_executors-1)
+            : ceil(size/num_of_executors),
+           size);
   pagerank->build_graph();
-  if (argc > 2)
-    pagerank->max_iterations = atoi(argv[2]);
-  pagerank->pregel();
+  pagerank->pregel(max_iterations);
   // collect and print the topk pageranks
   const int k = 10;
   set<tuple<int,float>,bool(*)(tuple<int,float>,tuple<int,float>)> topk (cmp_values);

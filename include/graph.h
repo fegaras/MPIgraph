@@ -27,7 +27,7 @@
 
 using namespace std;
 
-const bool trace = true;
+const bool trace = false;
 
 /* A graph partition of an executor. A partition is associated with a set of vertices 
    that do not overlap with the vertices in other partitions. It also contains all
@@ -97,11 +97,15 @@ public:
 
   // add a graph edge
   void add_edge ( ID from, ID to, E edge_val ) {
+    if (trace)
+      printf("adding edge %d -> %d\n",from,to);
     tmp_edges->push_back(tuple<ID,ID,E>(from,to,edge_val));
   }
 
   // add a sink (a vertex that doesn't have any out-neighbors)
   void add_sink ( ID vertex ) {
+    if (trace)
+      printf("adding sink %d\n",vertex);
     tmp_sinks->push_back(vertex);
   }
 
@@ -121,7 +125,7 @@ public:
   //  and from the merged messages
   virtual V new_value ( V val, M acc ) = 0;
 
-  // calculate a message value to send to the edge destination;
+  // calculate the message value to send to the edge destination;
   //   new_val is the new vertex value of the edge source;
   //   degree is the number of out-neighbors
   virtual M send ( V new_val, E edge_val, int degree ) = 0;
@@ -129,10 +133,10 @@ public:
   // if true, activate this vertex in the next superstep
   virtual bool activate ( V old_val, V new_val ) = 0;
 
-  // the Pregel graph processing
-  void pregel ();
+  // Pregel graph processing
+  void pregel ( int max_iterations );
 
-  // iterate over vertices and apply f to each vertex at the coordinator
+  // brink the vertices at the coordinator and apply f to each vertex 
   void collect ( function<void(ID,V)> f );
 };
 
@@ -226,26 +230,22 @@ void GraphPartition<ID,V,E,M>::build_graph () {
     e.value = get<2>(te);
     edges.push_back(e);
   }
-  if (trace) {
-    float size = (vertices.size()*sizeof(vertex_t)
-                  +edges.size()*sizeof(edge_t))/1024.0/1024.0;
-    printf("Executor %d: vertices=%ld, edges=%ld, cache=%.3f MBs\n",
-           executor_rank,vertices.size(),edges.size(),size);
-  }
+  float size = (vertices.size()*sizeof(vertex_t)
+                +edges.size()*sizeof(edge_t))/1024.0/1024.0;
+  printf("Executor %d: vertices=%ld, edges=%ld, cache=%.3f MBs\n",
+         executor_rank,vertices.size(),edges.size(),size);
   delete tmp_vertices;
   delete tmp_edges;
   barrier();
   i = 0;
 } 
 
-// the Pregel graph processing
+// Pregel graph processing
 template< typename ID, typename V, typename E, typename M >
-void GraphPartition<ID,V,E,M>::pregel () {
+void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
   vector<tuple<int,M>> outgoing;
-  vector<tuple<int,M>> in_msgs;
   vector<tuple<int,M>> out_msgs;
-  if (trace)
-    printf("Starting Pregel on %d\n",current_partition);
+  this->max_iterations = max_iterations;
   for ( auto &v: vertices ) {
     v.value = initialize(v.id);
     v.message = zero;
@@ -256,38 +256,53 @@ void GraphPartition<ID,V,E,M>::pregel () {
   double total_time = time;
   int step = 1;
   for ( ; step <= max_iterations; step++ ) {
-    // superstep
+    // start a superstep
     outgoing.clear();
     out_msgs.clear();
-    in_msgs.clear();
-//    for ( auto &e: edges )
-//      e.message = zero;
-    // calculate the outgoing messages from the vertex data from the previous superstep
+    for ( auto &e: edges )
+      e.message = zero;
+    // calculate the edge messages from the vertex data from the previous superstep
     for ( int i = 0; i < vertices.size(); i++ ) {
       auto &v = vertices[i];
-      v.value = (step == 1) ? initialize(v.id) : new_value(v.value,v.message);
-cout << i << " " << v.message << " " << v.value << endl;
-      int n = (i+1 == vertices.size()) ? vertices.size() : vertices[i+1].first_edge;
-      for ( int j = v.first_edge; j < n; j++ )
+      v.active = false;
+      int n = (i+1 == vertices.size()) ? edges.size() : vertices[i+1].first_edge;
+      for ( int j = v.first_edge; j < n; j++ ) {
         edges[j].message = merge(edges[j].message,
                                  send(v.value,edges[j].value,n-v.first_edge));
+        if (trace)
+          printf("setting the message of the edge %d->%d to %0.3f\n",
+                 i,edges[j].destination,edges[j].message);
+      }
     }
-    // compute outgoing messages
+    // put outgoing messages into a vector and sort them by the edge destination
     for ( auto e: edges )
       outgoing.push_back(tuple<int,M>(e.destination,e.message));
     sort(outgoing.begin(),outgoing.end(),
          [&](tuple<int,M> &x,tuple<int,M> &y)->bool {
              return get<0>(x) < get<0>(y);
          });
+    for ( auto &v: vertices )
+      v.message = zero;
     // create a thread to read incoming messages from other ranks
     thread in_thread(
        [&]()->void {
+         vector<tuple<int,M>> in_msgs;
          int buffer_size = sizeof(size_t)+total_num_of_vertices*sizeof(M);
          char* buffer = new char[buffer_size];
          for ( int i = 1; i < num_of_partitions; i++ ) {
+           in_msgs.clear();
            int rank = receive_data(buffer,buffer_size);
-           // append incoming messages from rank to in_msgs
+           // store the incoming messages from rank in in_msgs
            deserialize(in_msgs,buffer,buffer_size);
+           // update the vertex message from incomming messages
+           for ( auto &m: in_msgs ) {
+             auto &v = vertices[get<0>(m)-partitions[current_partition]];
+             v.message = merge(v.message,get<1>(m));
+             v.active = true;
+             if (trace)
+               printf("received on vertex %d a message %0.3f\n",
+                      v.id,v.message);
+           }
          }
          delete[] buffer;
        });
@@ -297,7 +312,6 @@ cout << i << " " << v.message << " " << v.value << endl;
     int next = (partitions.size() == 1) ? INT_MAX : partitions[1];
     M m;
     for ( auto t: outgoing ) {
-cout << "* " << get<0>(t) << " " << get<1>(t) << endl;
       if (index < 0) {
         index = get<0>(t);
         m = get<1>(t);
@@ -308,9 +322,18 @@ cout << "* " << get<0>(t) << " " << get<1>(t) << endl;
         m = merge(m,get<1>(t));
       else {
         if (p == current_partition) {
-cout << "*** " << index << " " << m << endl;
-          vertices[index-partitions[p]].message = m;
-        } else out_msgs.push_back(tuple<int,M>(index,m));
+          auto &v = vertices[index-partitions[p]];
+          if (trace)
+            printf("updating the message of vertex %d to %0.3f\n",
+                   index,m);
+          v.active = true;
+          v.message = merge(m,v.message);
+        } else {
+          if (trace)
+            printf("outgoing message of vertex %d: %0.3f\n",
+                   index,m);
+          out_msgs.push_back(tuple<int,M>(index,m));
+        }
         index = get<0>(t);
         m = get<1>(t);
         if (index >= next) {
@@ -328,9 +351,16 @@ cout << "*** " << index << " " << m << endl;
     }
     // same for last partition
     if (p == current_partition) {
-cout << "*** " << index << " " << m << endl;
-      vertices[index-partitions[p]].message = m;
+      auto &v = vertices[index-partitions[p]];
+      if (trace)
+        printf("updating the message of vertex %d to %0.3f\n",
+               index,m);
+      v.active = true;
+      v.message = merge(m,v.message);
     } else {
+      if (trace)
+        printf("outgoing message of vertex %d: %0.3f\n",
+               index,m);
       out_msgs.push_back(tuple<int,M>(index,m));
       char* buffer;
       int size = serialize(out_msgs,buffer);
@@ -338,18 +368,28 @@ cout << "*** " << index << " " << m << endl;
       out_msgs.clear();
       delete[] buffer;
     }
-    in_thread.join();
-    for ( auto &v: vertices )
-      v.message = zero;
-    // update the vertex message from incomming messages
-    for ( auto &m: in_msgs ) {
-      auto &v = vertices[get<0>(m)-partitions[current_partition]];
-      v.message = merge(v.message,get<1>(m));
+    // update vertex values from incomming messages
+    for ( int i = 0; i < vertices.size(); i++ ) {
+      auto &v = vertices[i];
+      if (v.active) {
+        V old_value = v.value;
+        v.value = new_value(v.value,v.message);
+        v.active = activate(v.value,old_value);
+        if (trace)
+          printf("changing value of vertex %d from %0.3f to %0.3f\n",
+                 v.id,old_value,v.value);
+      }
     }
+    in_thread.join();
     // end of a superstep
-    barrier();
-    if (trace && executor_rank == 0)
+    bool active = false;
+    for ( auto v: vertices )
+      active = active || v.active;
+    bool exit = !or_all(active);
+    if (executor_rank == 0)
       printf("Step %d took %.3f secs\n",step,MPI_Wtime()-time);
+    if (exit)
+      break;
     time = MPI_Wtime();
   }
   if (executor_rank == 0)
