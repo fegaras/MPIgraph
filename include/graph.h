@@ -20,6 +20,8 @@
 #include <climits>
 #include <algorithm>
 #include <thread>
+#include <mutex>
+#include <stdarg.h>
 #include "mpi.h"
 
 #include "serialization.h"
@@ -27,7 +29,12 @@
 
 using namespace std;
 
-const bool trace = false;
+#define trace false
+#ifdef trace
+#define destination(e) get_id(e.destination)
+#else
+#define destination(e) 0
+#endif
 
 /* A graph partition of an executor. A partition is associated with a set of vertices 
    that do not overlap with the vertices in other partitions. It also contains all
@@ -80,6 +87,23 @@ private:
   // get the index of a vertex id
   int id_loc ( ID id );
 
+  // get the vertex id at index loc
+  ID get_id ( int loc );
+
+  // print tracing info
+  void info ( const char* fmt, ... ) {
+    static mutex info_mutex;
+    if (trace) {
+      lock_guard<mutex> lock(info_mutex);
+      va_list args;
+      va_start(args,fmt);
+      printf("[%2d] ",executor_rank);
+      vprintf(fmt,args);
+      printf("\n");
+      va_end(args);
+    }
+  }
+
 public:
 
   int max_iterations = INT_MAX;
@@ -97,15 +121,13 @@ public:
 
   // add a graph edge
   void add_edge ( ID from, ID to, E edge_val ) {
-    if (trace)
-      printf("adding edge %d -> %d\n",from,to);
+    info("adding edge %d -> %d",from,to);
     tmp_edges->push_back(tuple<ID,ID,E>(from,to,edge_val));
   }
 
   // add a sink (a vertex that doesn't have any out-neighbors)
   void add_sink ( ID vertex ) {
-    if (trace)
-      printf("adding sink %d\n",vertex);
+    info("adding sink %d",vertex);
     tmp_sinks->push_back(vertex);
   }
 
@@ -151,6 +173,16 @@ int GraphPartition<ID,V,E,M>::id_loc ( ID id ) {
       return (it-first)+partitions[i];
   }
   return 0;
+}
+
+// get the vertex id at index loc
+template< typename ID, typename V, typename E, typename M >
+ID GraphPartition<ID,V,E,M>::get_id ( int loc ) {
+  for ( int i = 0; i < partitions.size(); i++ )
+    if (loc < partitions[i])
+      return (*tmp_vertices)[i-1][loc-partitions[i-1]];
+  return (*tmp_vertices)[partitions.size()-1]
+                [loc-partitions[partitions.size()-1]];
 }
 
 // build the graph partition from the edges and the sinks
@@ -234,11 +266,11 @@ void GraphPartition<ID,V,E,M>::build_graph () {
                 +edges.size()*sizeof(edge_t))/1024.0/1024.0;
   printf("Executor %d: vertices=%ld, edges=%ld, cache=%.3f MBs\n",
          executor_rank,vertices.size(),edges.size(),size);
-  delete tmp_vertices;
+  if (!trace)
+    delete tmp_vertices;
   delete tmp_edges;
   barrier();
-  i = 0;
-} 
+}
 
 // Pregel graph processing
 template< typename ID, typename V, typename E, typename M >
@@ -246,10 +278,8 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
   vector<tuple<int,M>> outgoing;
   vector<tuple<int,M>> out_msgs;
   this->max_iterations = max_iterations;
-  for ( auto &v: vertices ) {
+  for ( auto &v: vertices )
     v.value = initialize(v.id);
-    v.message = zero;
-  }
   for ( auto &e: edges )
     e.message = zero;
   double time = MPI_Wtime();
@@ -269,9 +299,8 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
       for ( int j = v.first_edge; j < n; j++ ) {
         edges[j].message = merge(edges[j].message,
                                  send(v.value,edges[j].value,n-v.first_edge));
-        if (trace)
-          printf("setting the message of the edge %d->%d to %0.3f\n",
-                 i,edges[j].destination,edges[j].message);
+        info("setting message of edge %d->%d to %0.3f",
+             v.id,destination(edges[j]),edges[j].message);
       }
     }
     // put outgoing messages into a vector and sort them by the edge destination
@@ -299,9 +328,8 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
              auto &v = vertices[get<0>(m)-partitions[current_partition]];
              v.message = merge(v.message,get<1>(m));
              v.active = true;
-             if (trace)
-               printf("received on vertex %d a message %0.3f\n",
-                      v.id,v.message);
+             info("received and merged on vertex %d a message %0.3f",
+                  v.id,v.message);
            }
          }
          delete[] buffer;
@@ -323,15 +351,12 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
       else {
         if (p == current_partition) {
           auto &v = vertices[index-partitions[p]];
-          if (trace)
-            printf("updating the message of vertex %d to %0.3f\n",
-                   index,m);
+          info("updating the message of vertex %d to %0.3f",v.id,m);
           v.active = true;
           v.message = merge(m,v.message);
         } else {
-          if (trace)
-            printf("outgoing message of vertex %d: %0.3f\n",
-                   index,m);
+          info("outgoing message to vertex %d at rank %d: %0.3f",
+               get_id(index),p,m);
           out_msgs.push_back(tuple<int,M>(index,m));
         }
         index = get<0>(t);
@@ -344,30 +369,40 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
             out_msgs.clear();
             delete[] buffer;
           }
-          p++;
+          int old_p = p;
+          for ( int i = p+1; i < partitions.size(); i++ )
+            if (index >= partitions[i])
+              p = i;
+          if (old_p+1 < p) {
+            // send empty vector
+            char* buffer;
+            int size = serialize(out_msgs,buffer);
+            for ( int i = old_p+1; i < p; i++ )
+              send_data(i,buffer,size,0);
+            delete[] buffer;
+          }
           next = (p+1 == partitions.size()) ? INT_MAX : partitions[p+1];
         }
       }
     }
-    // same for last partition
-    if (p == current_partition) {
+    { // same for last partition
       auto &v = vertices[index-partitions[p]];
-      if (trace)
-        printf("updating the message of vertex %d to %0.3f\n",
-               index,m);
-      v.active = true;
-      v.message = merge(m,v.message);
-    } else {
-      if (trace)
-        printf("outgoing message of vertex %d: %0.3f\n",
-               index,m);
-      out_msgs.push_back(tuple<int,M>(index,m));
-      char* buffer;
-      int size = serialize(out_msgs,buffer);
-      send_data(p,buffer,size,0);
-      out_msgs.clear();
-      delete[] buffer;
+      if (p == current_partition) {
+        info("updating the message of vertex %d to %0.3f",v.id,m);
+        v.active = true;
+        v.message = merge(m,v.message);
+      } else {
+          info("outgoing message to vertex %d at rank %d: %0.3f",
+               get_id(index),p,m);
+        out_msgs.push_back(tuple<int,M>(index,m));
+        char* buffer;
+        int size = serialize(out_msgs,buffer);
+        send_data(p,buffer,size,0);
+        out_msgs.clear();
+        delete[] buffer;
+      }
     }
+    in_thread.join();
     // update vertex values from incomming messages
     for ( int i = 0; i < vertices.size(); i++ ) {
       auto &v = vertices[i];
@@ -375,20 +410,17 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
         V old_value = v.value;
         v.value = new_value(v.value,v.message);
         v.active = activate(v.value,old_value);
-        if (trace)
-          printf("changing value of vertex %d from %0.3f to %0.3f\n",
-                 v.id,old_value,v.value);
+        info("changing value of vertex %d from %0.3f to %0.3f",
+             v.id,old_value,v.value);
       }
     }
-    in_thread.join();
     // end of a superstep
+    if (executor_rank == 0)
+      printf("Step %d took %.3f secs\n",step,MPI_Wtime()-time);
     bool active = false;
     for ( auto v: vertices )
       active = active || v.active;
-    bool exit = !or_all(active);
-    if (executor_rank == 0)
-      printf("Step %d took %.3f secs\n",step,MPI_Wtime()-time);
-    if (exit)
+    if (!or_all(active))
       break;
     time = MPI_Wtime();
   }

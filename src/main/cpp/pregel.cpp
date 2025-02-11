@@ -26,6 +26,7 @@ using namespace std;
 
 class PageRank: public GraphPartition<int,float,char,float> {
   int num_of_vertices;
+  const float damping_factor = 0.85;
 public:
   PageRank ( int num_of_vertices ): GraphPartition() {
     this->num_of_vertices = num_of_vertices;
@@ -42,11 +43,11 @@ public:
   }
 
   float new_value ( float val, float acc ) {
-    return acc;
+    return (1.0-damping_factor)/num_of_vertices + damping_factor*acc;
   }
 
   float send ( float new_val, char edge_val, int degree ) {
-    return 0.15/num_of_vertices+0.85*new_val/degree;
+    return new_val/degree;
   }
 
   bool activate ( float new_val, float old_val ) {
@@ -57,12 +58,14 @@ public:
 PageRank* pagerank;
 
 void ae ( int from, int to ) {
-  pagerank->add_edge(from,to,0);
+  if ( from % num_of_executors == executor_rank )
+    pagerank->add_edge(from,to,0);
 }
 
 void test_graph () {
   // https://en.wikipedia.org/wiki/PageRank#/media/File:PageRanks-Example.svg
-  pagerank->add_sink(1);
+  if ( executor_rank == 0 )
+    pagerank->add_sink(1);
   ae(2,1); ae(2,3); ae(4,2); ae(4,3); ae(4,10);
   ae(5,3); ae(5,4); ae(6,3); ae(6,4); ae(7,3); ae(7,4);
   ae(8,4); ae(9,4); ae(10,4); ae(10,3); ae(0,3); ae(3,0);
@@ -73,7 +76,7 @@ const int max_degree = 100;
 // generates random int values according to an exponential distribution
 int random_degree ( int max_degree ) {
   static default_random_engine generator(executor_rank*33);
-  static exponential_distribution<double> distribution(10.0);
+  static exponential_distribution<double> distribution(20.0);
   double rv;
   do
     rv = distribution(generator);
@@ -108,7 +111,7 @@ int main ( int argc, char* argv[] ) {
   assert(size > 1);
   int max_iterations = (argc > 2) ? atoi(argv[2]) : 1;
   pagerank = new PageRank(size);
-  // test_graph();
+  if (false) test_graph(); else
   generate_random_graph_partition(executor_rank*ceil(size/num_of_executors),
            (executor_rank == num_of_executors-1)
             ? size - ceil(size/num_of_executors)*(num_of_executors-1)
@@ -133,7 +136,7 @@ int main ( int argc, char* argv[] ) {
   if (executor_rank == 0) {
     printf("Top-%d pageranks:\n",k);
     for ( auto t: topk )
-      printf("%10d\t%0.3f\n",get<0>(t),get<1>(t));
+      printf("%10d\t%0.8f\n",get<0>(t),get<1>(t));
   }
   end_comm();
   return 0;

@@ -5,4 +5,4 @@ debug:
 	mpic++ -g -std=c++11 -D _GLIBCXX_DEBUG -D _GLIBCXX_DEBUG_PEDANTIC -Iinclude src/main/cpp/*.cpp -o pregel
 
 clean: 
-	/bin/rm -f a.out src/main/cpp/*~ include/*~
+	/bin/rm -f pregel *~ src/main/cpp/*~ include/*~
