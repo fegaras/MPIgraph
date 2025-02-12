@@ -28,7 +28,7 @@ const bool trace = false;
 const auto comm = MPI_COMM_WORLD;
 
 // send data to an MPI executor
-void send_data ( int rank, char* &buffer, size_t len, int tag ) {
+void send_data ( int rank, char* buffer, size_t len, int tag ) {
   MPI_Send(buffer,len,MPI_BYTE,rank,tag,comm);
   if (trace)
     printf("Executor %d: sent %ld bytes to %d\n",
@@ -36,17 +36,17 @@ void send_data ( int rank, char* &buffer, size_t len, int tag ) {
 }
 
 // broadcast data to all executors
-void bcast_data ( char* &buffer, const size_t buffer_size ) {
+void bcast_data ( char* buffer, const size_t buffer_size ) {
   MPI_Bcast(buffer,buffer_size,MPI_BYTE,executor_rank,comm);
   if (trace)
     printf("Executor %d: broadcast %ld bytes\n",
            executor_rank,buffer_size);
 }
 
-// receive data from any MPI executor - return the executor rank
-int receive_data ( char* &buffer, const size_t buffer_size ) {
+// receive data from rank
+int receive_data ( char* buffer, const size_t buffer_size, int rank ) {
   MPI_Status status;
-  MPI_Recv(buffer,buffer_size,MPI_BYTE,MPI_ANY_SOURCE,MPI_ANY_TAG,comm,&status);
+  MPI_Recv(buffer,buffer_size,MPI_BYTE,rank,MPI_ANY_TAG,comm,&status);
   if (trace) {
     int count;
     MPI_Get_count(&status,MPI_BYTE,&count);
@@ -54,6 +54,11 @@ int receive_data ( char* &buffer, const size_t buffer_size ) {
            executor_rank,count,status.MPI_SOURCE);
   }
   return status.MPI_SOURCE;
+}
+
+// receive data from any MPI executor - return the sender rank
+int receive_data ( char* buffer, const size_t buffer_size ) {
+  return receive_data(buffer,buffer_size,MPI_ANY_SOURCE);
 }
 
 // or-together all values (blocking)

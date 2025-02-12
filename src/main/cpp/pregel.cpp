@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include <functional>
 #include <set>
 #include <random>
 #include <cassert>
@@ -24,15 +23,17 @@
 
 using namespace std;
 
-class PageRank: public GraphPartition<int,float,char,float> {
-  int num_of_vertices;
+class PageRank: public GraphPartition<long,float,char,float> {
+  long num_of_vertices;
   const float damping_factor = 0.85;
+
 public:
-  PageRank ( int num_of_vertices ): GraphPartition() {
+
+  PageRank ( long num_of_vertices ): GraphPartition() {
     this->num_of_vertices = num_of_vertices;
   }
 
-  float initialize ( int id ) {
+  float initialize ( long id ) {
     return 1.0/num_of_vertices;
   }
 
@@ -84,31 +85,34 @@ int random_degree ( int max_degree ) {
   return int((max_degree-1)*rv)+1;
 }
 
-void generate_random_graph_partition ( int start, int size, int total_size ) {
+void generate_random_graph_partition ( long start, long size, long total_size ) {
   static default_random_engine gen(executor_rank*11);
-  static uniform_int_distribution<int> distr(0,total_size-1);
-  set<int> s;
-  for ( int i = 0; i < size; i++ )
-    if (distr(gen) < ceil(total_size/30))
+  static uniform_int_distribution<long> distr(0L,total_size-1);
+  set<long> s;
+  for ( long i = 0; i < size; i++ )
+    if (distr(gen)+1 < total_size*0.1)
       pagerank->add_sink(start+i);
     else {
       s.clear();
       for ( int j = random_degree(max_degree); j > 0; j-- )
         s.insert(distr(gen));
-      for ( int e: s )
+      for ( long e: s )
         pagerank->add_edge(start+i,e,0);
     }
 }
 
-bool cmp_values ( tuple<int,float> x, tuple<int,float> y ) {
+bool cmp_values ( tuple<long,float> x, tuple<long,float> y ) {
   return get<1>(x) >= get<1>(y);
 }
 
 int main ( int argc, char* argv[] ) {
   // vertices per partition
-  int size = (argc > 1) ? atoi(argv[1]) : 1000;
+  long size = (argc > 1) ? atol(argv[1]) : 1000;
   start_comm(argc,argv);
-  assert(size > 1);
+  if (size <= 1) {
+    cerr << "A graph should have more than one edge\n";
+    abort_comm();
+  }
   int max_iterations = (argc > 2) ? atoi(argv[2]) : 1;
   pagerank = new PageRank(size);
   if (false) test_graph(); else
@@ -117,14 +121,15 @@ int main ( int argc, char* argv[] ) {
             ? size - ceil(size/num_of_executors)*(num_of_executors-1)
             : ceil(size/num_of_executors),
            size);
+  // doesn't need this: pagerank->partition([&](long x)->int{ return x%num_of_executors; });
   pagerank->build_graph();
   pagerank->pregel(max_iterations);
   // collect and print the topk pageranks
   const int k = 10;
-  set<tuple<int,float>,bool(*)(tuple<int,float>,tuple<int,float>)> topk (cmp_values);
+  set<tuple<long,float>,bool(*)(tuple<long,float>,tuple<long,float>)> topk(cmp_values);
   pagerank->collect(
-     [&](int id,float v) {
-       auto t = tuple<int,float>(id,v);
+     [&](long id,float v) {
+       auto t = tuple<long,float>(id,v);
        topk.insert(t);
        if (topk.size() == k) {
          auto it = topk.begin();
@@ -136,7 +141,7 @@ int main ( int argc, char* argv[] ) {
   if (executor_rank == 0) {
     printf("Top-%d pageranks:\n",k);
     for ( auto t: topk )
-      printf("%10d\t%0.8f\n",get<0>(t),get<1>(t));
+      printf("%10ld\t%0.8f\n",get<0>(t),get<1>(t));
   }
   end_comm();
   return 0;

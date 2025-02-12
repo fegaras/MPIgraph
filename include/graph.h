@@ -29,11 +29,12 @@
 
 using namespace std;
 
+// tracing works for long ID and float V and M only
 #define trace false
 #ifdef trace
-#define destination(e) get_id(e.destination)
+#define info(...) { info_(__VA_ARGS__); }
 #else
-#define destination(e) 0
+#define info(...) { }
 #endif
 
 /* A graph partition of an executor. A partition is associated with a set of vertices 
@@ -55,24 +56,24 @@ private:
   int current_partition;
 
   // each partition is associated with the index of its first vertex
-  vector<int> partitions;
+  vector<long> partitions;
 
-  int total_num_of_vertices;
+  long total_num_of_vertices;
 
   typedef struct {
-    ID id;           // vertex id
-    V value;         // vertex value
-    M message;       // the incoming message to this vertex
-    int first_edge;  // index of the first edge of this vertex (in edges)
-    bool active;     // is this vertex active?
+    ID id;            // vertex id
+    V value;          // vertex value
+    M message;        // the incoming message to this vertex
+    long first_edge;  // index of the first edge of this vertex (in edges)
+    bool active;      // is this vertex active?
   } vertex_t;
   // local vertices
   vector<vertex_t> vertices;
 
   typedef struct {
-    int destination; // the index of the edge destination
-    E value;         // edge value
-    M message;       // the outgoing message to be send to the edge destination
+    long destination; // the index of the edge destination
+    E value;          // edge value
+    M message;        // the outgoing message to be send to the edge destination
   } edge_t;
   // contains the out-neighbors of the local vertices
   vector<edge_t> edges;
@@ -85,13 +86,13 @@ private:
   vector<tuple<ID,ID,E>>* tmp_edges;
 
   // get the index of a vertex id
-  int id_loc ( ID id );
+  long id_loc ( ID id );
 
   // get the vertex id at index loc
-  ID get_id ( int loc );
+  ID get_id ( long loc );
 
   // print tracing info
-  void info ( const char* fmt, ... ) {
+  void info_ ( const char* fmt, ... ) {
     static mutex info_mutex;
     if (trace) {
       lock_guard<mutex> lock(info_mutex);
@@ -106,12 +107,10 @@ private:
 
 public:
 
-  int max_iterations = INT_MAX;
-
   GraphPartition () {
     num_of_partitions = num_of_executors;
     current_partition = executor_rank;
-    partitions = vector<int>(num_of_partitions,0);
+    partitions = vector<long>(num_of_partitions,0);
     tmp_vertices = new vector<vector<ID>>();
     tmp_sinks = new vector<ID>();
     for ( int i = 0; i < num_of_partitions; i++ )
@@ -121,15 +120,18 @@ public:
 
   // add a graph edge
   void add_edge ( ID from, ID to, E edge_val ) {
-    info("adding edge %d -> %d",from,to);
+    info("adding edge %ld -> %ld",from,to);
     tmp_edges->push_back(tuple<ID,ID,E>(from,to,edge_val));
   }
 
   // add a sink (a vertex that doesn't have any out-neighbors)
   void add_sink ( ID vertex ) {
-    info("adding sink %d",vertex);
+    info("adding sink %ld",vertex);
     tmp_sinks->push_back(vertex);
   }
+
+  // redistribute edges and sinks based on the hash function
+  void partition ( function<int(ID)> hash );
 
   // build the graph partitions from the edges and the sinks
   void build_graph ();
@@ -152,7 +154,7 @@ public:
   //   degree is the number of out-neighbors
   virtual M send ( V new_val, E edge_val, int degree ) = 0;
 
-  // if true, activate this vertex in the next superstep
+  // if true, activate this vertex at the next superstep
   virtual bool activate ( V old_val, V new_val ) = 0;
 
   // Pregel graph processing
@@ -164,7 +166,7 @@ public:
 
 // get the index of a vertex id
 template< typename ID, typename V, typename E, typename M >
-int GraphPartition<ID,V,E,M>::id_loc ( ID id ) {
+long GraphPartition<ID,V,E,M>::id_loc ( ID id ) {
   for ( int i = 0; i < num_of_partitions; i++ ) {
     auto first = (*tmp_vertices)[i].begin();
     auto last = (*tmp_vertices)[i].end();
@@ -177,12 +179,77 @@ int GraphPartition<ID,V,E,M>::id_loc ( ID id ) {
 
 // get the vertex id at index loc
 template< typename ID, typename V, typename E, typename M >
-ID GraphPartition<ID,V,E,M>::get_id ( int loc ) {
-  for ( int i = 0; i < partitions.size(); i++ )
+ID GraphPartition<ID,V,E,M>::get_id ( long loc ) {
+  for ( int i = 0; i < num_of_partitions; i++ )
     if (loc < partitions[i])
       return (*tmp_vertices)[i-1][loc-partitions[i-1]];
-  return (*tmp_vertices)[partitions.size()-1]
-                [loc-partitions[partitions.size()-1]];
+  return (*tmp_vertices)[num_of_partitions-1]
+                [loc-partitions[num_of_partitions-1]];
+}
+
+// redistribute edges and sinks based on the hash function
+template< typename ID, typename V, typename E, typename M >
+void GraphPartition<ID,V,E,M>::partition ( function<int(ID)> hash ) {
+  vector<vector<ID>> out_sinks;
+  vector<vector<tuple<ID,ID,E>>> out_edges;
+  long num_of_edges = tmp_edges->size();
+  for ( int i = 0; i < num_of_partitions; i++ ) {
+    out_sinks.push_back(vector<ID>());
+    out_edges.push_back(vector<tuple<ID,ID,E>>());
+  }
+  while (!tmp_sinks->empty()) {
+    auto id = tmp_sinks->back();
+    tmp_sinks->pop_back();
+    out_sinks[abs(hash(id))%num_of_partitions].push_back(id);
+  }
+  while (!tmp_edges->empty()) {
+    auto t = tmp_edges->back();
+    tmp_edges->pop_back();
+    out_edges[abs(hash(get<0>(t)))%num_of_partitions].push_back(t);
+  }
+  delete tmp_sinks; delete tmp_edges;
+  tmp_sinks = new vector<ID>(out_sinks[current_partition]);
+  tmp_edges = new vector<tuple<ID,ID,E>>(out_edges[current_partition]);
+  thread trcv(
+      [&]()->void {
+        size_t max_size = 0;
+        size_t size;
+        for ( int i = 1; i < num_of_partitions; i++ ) {
+          receive_data((char*)&size,sizeof(size_t));
+          max_size = max(max_size,size);
+        }
+        char* buffer = new char[max_size];
+        for ( int i = 1; i < num_of_partitions; i++ ) {
+          receive_data(buffer,size);
+          deserialize(*tmp_sinks,buffer,size);
+        }
+        for ( int i = 1; i < num_of_partitions; i++ ) {
+          receive_data(buffer,size);
+          deserialize(*tmp_edges,buffer,size);
+        }
+        delete[] buffer;
+      });
+  for ( int i = 0; i < num_of_partitions; i++ )
+    if (i != current_partition) {
+      size_t size = sizeof(size_t)+out_edges[i].size()*sizeof(edge_t);
+      send_data(i,(char*)&size,sizeof(size_t),0);
+    }
+  barrier();
+  char* buffer;
+  for ( int i = 0; i < num_of_partitions; i++ )
+    if (i != current_partition) {
+      size_t size = serialize(out_sinks[i],buffer);
+      send_data(i,buffer,size,0);
+      delete[] buffer;
+    }
+  barrier();
+  for ( int i = 0; i < num_of_partitions; i++ )
+    if (i != current_partition) {
+      size_t size = serialize(out_edges[i],buffer);
+      send_data(i,buffer,size,0);
+      delete[] buffer;
+    }
+  trcv.join();
 }
 
 // build the graph partition from the edges and the sinks
@@ -195,7 +262,7 @@ void GraphPartition<ID,V,E,M>::build_graph () {
        });
   sort(tmp_sinks->begin(),tmp_sinks->end());
   ID vid;
-  int index = 0;
+  long index = 0;
   auto sink_it = tmp_sinks->begin();
   for ( auto &t: *tmp_edges ) {
     while (sink_it != tmp_sinks->end() && *sink_it < get<0>(t)) {
@@ -230,7 +297,7 @@ void GraphPartition<ID,V,E,M>::build_graph () {
   // create a thread to read the local vertices from all other ranks
   thread trcv(
       [&]()->void {
-        int buffer_size = sizeof(size_t)
+        size_t buffer_size = sizeof(size_t)
               +((*tmp_vertices)[current_partition].size()*num_of_partitions)*sizeof(ID);
         char* buffer = new char[buffer_size];
         for ( int i = 1; i < num_of_partitions; i++ ) {
@@ -240,7 +307,7 @@ void GraphPartition<ID,V,E,M>::build_graph () {
         delete[] buffer;
       });
   char* buffer;
-  int buffer_size = serialize((*tmp_vertices)[current_partition],buffer);
+  size_t buffer_size = serialize((*tmp_vertices)[current_partition],buffer);
   // broadcast the local vertices to all other ranks
   for ( int i = 0; i < num_of_partitions; i++ )
     if (i != current_partition)
@@ -248,7 +315,7 @@ void GraphPartition<ID,V,E,M>::build_graph () {
   trcv.join();
   delete[] buffer;
   // build the partition table
-  int n = 0;
+  long n = 0L;
   int i = 0;
   for ( auto tv: *tmp_vertices ) {
     partitions[i++] = n;
@@ -275,9 +342,8 @@ void GraphPartition<ID,V,E,M>::build_graph () {
 // Pregel graph processing
 template< typename ID, typename V, typename E, typename M >
 void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
-  vector<tuple<int,M>> outgoing;
-  vector<tuple<int,M>> out_msgs;
-  this->max_iterations = max_iterations;
+  vector<tuple<long,M>> outgoing;
+  vector<tuple<long,M>> out_msgs;
   for ( auto &v: vertices )
     v.value = initialize(v.id);
   for ( auto &e: edges )
@@ -292,22 +358,22 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
     for ( auto &e: edges )
       e.message = zero;
     // calculate the edge messages from the vertex data from the previous superstep
-    for ( int i = 0; i < vertices.size(); i++ ) {
+    for ( long i = 0; i < vertices.size(); i++ ) {
       auto &v = vertices[i];
       v.active = false;
-      int n = (i+1 == vertices.size()) ? edges.size() : vertices[i+1].first_edge;
-      for ( int j = v.first_edge; j < n; j++ ) {
+      long n = (i+1 == vertices.size()) ? edges.size() : vertices[i+1].first_edge;
+      for ( long j = v.first_edge; j < n; j++ ) {
         edges[j].message = merge(edges[j].message,
                                  send(v.value,edges[j].value,n-v.first_edge));
-        info("setting message of edge %d->%d to %0.3f",
-             v.id,destination(edges[j]),edges[j].message);
+        info("setting message of edge %ld->%ld to %0.3f",
+             v.id,get_id(edges[j].destination),edges[j].message);
       }
     }
     // put outgoing messages into a vector and sort them by the edge destination
     for ( auto e: edges )
-      outgoing.push_back(tuple<int,M>(e.destination,e.message));
+      outgoing.push_back(tuple<long,M>(e.destination,e.message));
     sort(outgoing.begin(),outgoing.end(),
-         [&](tuple<int,M> &x,tuple<int,M> &y)->bool {
+         [&](tuple<long,M> &x,tuple<long,M> &y)->bool {
              return get<0>(x) < get<0>(y);
          });
     for ( auto &v: vertices )
@@ -315,8 +381,8 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
     // create a thread to read incoming messages from other ranks
     thread in_thread(
        [&]()->void {
-         vector<tuple<int,M>> in_msgs;
-         int buffer_size = sizeof(size_t)+total_num_of_vertices*sizeof(M);
+         vector<tuple<long,M>> in_msgs;
+         size_t buffer_size = sizeof(size_t)+total_num_of_vertices*sizeof(tuple<long,M>);
          char* buffer = new char[buffer_size];
          for ( int i = 1; i < num_of_partitions; i++ ) {
            in_msgs.clear();
@@ -328,22 +394,22 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
              auto &v = vertices[get<0>(m)-partitions[current_partition]];
              v.message = merge(v.message,get<1>(m));
              v.active = true;
-             info("received and merged on vertex %d a message %0.3f",
+             info("received and merged on vertex %ld a message %0.3f",
                   v.id,v.message);
            }
          }
          delete[] buffer;
        });
     // send outgoing messages to other ranks
-    int index = -1;
+    long index = -1;
     int p = 0;  // partition index
-    int next = (partitions.size() == 1) ? INT_MAX : partitions[1];
+    long next = (num_of_partitions == 1) ? INT_MAX : partitions[1];
     M m;
     for ( auto t: outgoing ) {
       if (index < 0) {
         index = get<0>(t);
         m = get<1>(t);
-        for ( int i = 0; i < partitions.size(); i++ )
+        for ( int i = 0; i < num_of_partitions; i++ )
           if (index >= partitions[i])
             p = i;
       } else if (get<0>(t) == index)
@@ -351,66 +417,70 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
       else {
         if (p == current_partition) {
           auto &v = vertices[index-partitions[p]];
-          info("updating the message of vertex %d to %0.3f",v.id,m);
+          info("updating the message of vertex %ld to %0.3f",v.id,m);
           v.active = true;
           v.message = merge(m,v.message);
         } else {
-          info("outgoing message to vertex %d at rank %d: %0.3f",
+          info("outgoing message to vertex %ld at rank %d: %0.3f",
                get_id(index),p,m);
-          out_msgs.push_back(tuple<int,M>(index,m));
+          out_msgs.push_back(tuple<long,M>(index,m));
         }
         index = get<0>(t);
         m = get<1>(t);
         if (index >= next) {
           if (p != current_partition) {
             char* buffer;
-            int size = serialize(out_msgs,buffer);
+            size_t size = serialize(out_msgs,buffer);
             send_data(p,buffer,size,0);
             out_msgs.clear();
             delete[] buffer;
           }
           int old_p = p;
-          for ( int i = p+1; i < partitions.size(); i++ )
+          for ( int i = p+1; i < num_of_partitions; i++ )
             if (index >= partitions[i])
               p = i;
           if (old_p+1 < p) {
             // send empty vector
             char* buffer;
-            int size = serialize(out_msgs,buffer);
+            size_t size = serialize(out_msgs,buffer);
             for ( int i = old_p+1; i < p; i++ )
               send_data(i,buffer,size,0);
             delete[] buffer;
           }
-          next = (p+1 == partitions.size()) ? INT_MAX : partitions[p+1];
+          next = (p+1 == num_of_partitions) ? INT_MAX : partitions[p+1];
         }
       }
     }
     { // same for last partition
       auto &v = vertices[index-partitions[p]];
       if (p == current_partition) {
-        info("updating the message of vertex %d to %0.3f",v.id,m);
+        info("updating the message of vertex %ld to %0.3f",v.id,m);
         v.active = true;
         v.message = merge(m,v.message);
       } else {
-          info("outgoing message to vertex %d at rank %d: %0.3f",
-               get_id(index),p,m);
-        out_msgs.push_back(tuple<int,M>(index,m));
+        info("outgoing message to vertex %ld at rank %d: %0.3f",
+             get_id(index),p,m);
+        out_msgs.push_back(tuple<long,M>(index,m));
         char* buffer;
-        int size = serialize(out_msgs,buffer);
+        size_t size = serialize(out_msgs,buffer);
         send_data(p,buffer,size,0);
         out_msgs.clear();
+        // send empty vector to remaining ranks
+        size = serialize(out_msgs,buffer);
+        for ( int i = p+1; i < num_of_partitions; i++ )
+          send_data(i,buffer,size,0);
         delete[] buffer;
       }
     }
     in_thread.join();
     // update vertex values from incomming messages
-    for ( int i = 0; i < vertices.size(); i++ ) {
+    for ( long i = 0; i < vertices.size(); i++ ) {
       auto &v = vertices[i];
       if (v.active) {
         V old_value = v.value;
         v.value = new_value(v.value,v.message);
         v.active = activate(v.value,old_value);
-        info("changing value of vertex %d from %0.3f to %0.3f",
+        info("changing value of vertex %ld from %0.3f to %0.3f",
              v.id,old_value,v.value);
       }
     }
@@ -420,8 +490,10 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
     bool active = false;
     for ( auto v: vertices )
       active = active || v.active;
-    if (!or_all(active))
+    if (!or_all(active)) {  // barrier synchronization
+      step++;
       break;
+    }
     time = MPI_Wtime();
   }
   if (executor_rank == 0)
@@ -433,7 +505,7 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
 template< typename ID, typename V, typename E, typename M >
 void GraphPartition<ID,V,E,M>::collect ( function<void(ID,V)> f ) {
   const int coordinator = 0;
-  int buffer_size = sizeof(size_t)+vertices.size()*sizeof(vertex_t)+100;
+  size_t buffer_size = sizeof(size_t)+total_num_of_vertices*sizeof(vertex_t);
   if (executor_rank == coordinator) {
     vector<vertex_t> in_vertices;
     for ( auto &v: vertices )
@@ -449,7 +521,7 @@ void GraphPartition<ID,V,E,M>::collect ( function<void(ID,V)> f ) {
     delete[] buffer;
   } else {
     char* buffer;
-    int size = serialize(vertices,buffer);
+    size_t size = serialize(vertices,buffer);
     send_data(0,buffer,size,0);
     delete[] buffer;
   }

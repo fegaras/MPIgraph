@@ -18,13 +18,15 @@ extern int num_of_executors;
 extern int executor_rank;
 
 // send data to an MPI executor
-void send_data ( int rank, char* &buffer, size_t len, int tag );
+void send_data ( int rank, char* buffer, size_t len, int tag );
 
 // broadcast data to all executors
-void bcast_data ( char* &buffer, size_t len );
+void bcast_data ( char* buffer, size_t len );
 
-// receive data from any MPI executor - return the executor rank
-int receive_data ( char* &buffer, const size_t buffer_size );
+// receive data from rank
+int receive_data ( char* buffer, const size_t buffer_size, int rank );
+// receive data from any MPI executor - return the sender rank
+int receive_data ( char* buffer, const size_t buffer_size );
 
 // or-together all values (blocking)
 bool or_all ( bool b );
