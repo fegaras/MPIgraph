@@ -58,6 +58,9 @@ private:
   // each partition is associated with the index of its first vertex
   vector<long> partitions;
 
+  // # of vertices in each partition
+  vector<size_t> partition_vertices;
+
   long total_num_of_vertices;
 
   typedef struct {
@@ -110,7 +113,7 @@ public:
   GraphPartition () {
     num_of_partitions = num_of_executors;
     current_partition = executor_rank;
-    partitions = vector<long>(num_of_partitions,0);
+    partitions = vector<long>(num_of_partitions+1,0);
     tmp_vertices = new vector<vector<ID>>();
     tmp_sinks = new vector<ID>();
     for ( int i = 0; i < num_of_partitions; i++ )
@@ -190,6 +193,7 @@ ID GraphPartition<ID,V,E,M>::get_id ( long loc ) {
 // redistribute edges and sinks based on the hash function
 template< typename ID, typename V, typename E, typename M >
 void GraphPartition<ID,V,E,M>::partition ( function<int(ID)> hash ) {
+  double time = MPI_Wtime();
   vector<vector<ID>> out_sinks;
   vector<vector<tuple<ID,ID,E>>> out_edges;
   long num_of_edges = tmp_edges->size();
@@ -210,31 +214,25 @@ void GraphPartition<ID,V,E,M>::partition ( function<int(ID)> hash ) {
   delete tmp_sinks; delete tmp_edges;
   tmp_sinks = new vector<ID>(out_sinks[current_partition]);
   tmp_edges = new vector<tuple<ID,ID,E>>(out_edges[current_partition]);
+  size_t max_size = 0;
+  for ( int i = 0; i < num_of_partitions; i++ )
+    if (i != current_partition)
+      max_size = max(max_size,max(out_edges[i].size(),out_sinks[i].size()));
+  max_size = max_all(max_size);
   thread trcv(
       [&]()->void {
-        size_t max_size = 0;
-        size_t size;
+        size_t buffer_size = sizeof(size_t)+max_size*sizeof(tuple<ID,ID,E>);
+        char* buffer = new char[buffer_size];
         for ( int i = 1; i < num_of_partitions; i++ ) {
-          receive_data((char*)&size,sizeof(size_t));
-          max_size = max(max_size,size);
-        }
-        char* buffer = new char[max_size];
-        for ( int i = 1; i < num_of_partitions; i++ ) {
-          receive_data(buffer,size);
-          deserialize(*tmp_sinks,buffer,size);
+          receive_data(buffer,buffer_size);
+          deserialize(*tmp_sinks,buffer,buffer_size);
         }
         for ( int i = 1; i < num_of_partitions; i++ ) {
-          receive_data(buffer,size);
-          deserialize(*tmp_edges,buffer,size);
+          receive_data(buffer,buffer_size);
+          deserialize(*tmp_edges,buffer,buffer_size);
         }
         delete[] buffer;
       });
-  for ( int i = 0; i < num_of_partitions; i++ )
-    if (i != current_partition) {
-      size_t size = sizeof(size_t)+out_edges[i].size()*sizeof(edge_t);
-      send_data(i,(char*)&size,sizeof(size_t),0);
-    }
-  barrier();
   char* buffer;
   for ( int i = 0; i < num_of_partitions; i++ )
     if (i != current_partition) {
@@ -250,11 +248,14 @@ void GraphPartition<ID,V,E,M>::partition ( function<int(ID)> hash ) {
       delete[] buffer;
     }
   trcv.join();
+  if (executor_rank == 0)
+    printf("Graph partition time = %.3f secs\n",MPI_Wtime()-time);
 }
 
 // build the graph partition from the edges and the sinks
 template< typename ID, typename V, typename E, typename M >
 void GraphPartition<ID,V,E,M>::build_graph () {
+  double time = MPI_Wtime();
   // build the local graph partition from the tmp vectors
   sort(tmp_edges->begin(),tmp_edges->end(),
        [&](tuple<ID,ID,E> x,tuple<ID,ID,E> y)->bool {
@@ -294,32 +295,29 @@ void GraphPartition<ID,V,E,M>::build_graph () {
     sink_it++;
   }
   delete tmp_sinks;
-  // create a thread to read the local vertices from all other ranks
-  thread trcv(
-      [&]()->void {
-        size_t buffer_size = sizeof(size_t)
-              +((*tmp_vertices)[current_partition].size()*num_of_partitions)*sizeof(ID);
-        char* buffer = new char[buffer_size];
-        for ( int i = 1; i < num_of_partitions; i++ ) {
-          int rank = receive_data(buffer,buffer_size);
-          deserialize((*tmp_vertices)[rank],buffer,buffer_size);
-        }
-        delete[] buffer;
-      });
-  char* buffer;
-  size_t buffer_size = serialize((*tmp_vertices)[current_partition],buffer);
-  // broadcast the local vertices to all other ranks
+  // broadcast the # of vertices in each partition to all ranks
+  partition_vertices.resize(num_of_partitions);
+  partition_vertices[current_partition] = (*tmp_vertices)[current_partition].size();
+  barrier();
   for ( int i = 0; i < num_of_partitions; i++ )
+    bcast_data(i,(char*)&(partition_vertices[i]),sizeof(size_t));
+  // broadcast the local vertices to all ranks
+  char* cbuffer;
+  serialize((*tmp_vertices)[current_partition],cbuffer);
+  for ( int i = 0; i < num_of_partitions; i++ ) {
+    size_t buffer_size = sizeof(size_t)+partition_vertices[i]*sizeof(ID);
+    char* buffer = (i == current_partition) ? cbuffer : new char[buffer_size];
+    bcast_data(i,buffer,buffer_size);
     if (i != current_partition)
-      send_data(i,buffer,buffer_size,0);
-  trcv.join();
-  delete[] buffer;
+      deserialize((*tmp_vertices)[i],buffer,buffer_size);
+    delete[] buffer;
+  }
   // build the partition table
-  long n = 0L;
+  size_t n = 0;
   int i = 0;
-  for ( auto tv: *tmp_vertices ) {
-    partitions[i++] = n;
-    n += tv.size();
+  for ( auto size: partition_vertices ) {
+    n += size;
+    partitions[++i] = n;
   }
   total_num_of_vertices = n;
   // store edges using indices (offsets) for destination
@@ -337,6 +335,8 @@ void GraphPartition<ID,V,E,M>::build_graph () {
     delete tmp_vertices;
   delete tmp_edges;
   barrier();
+  if (executor_rank == 0)
+    printf("Graph build time = %.3f secs\n",MPI_Wtime()-time);
 }
 
 // Pregel graph processing
@@ -344,10 +344,10 @@ template< typename ID, typename V, typename E, typename M >
 void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
   vector<tuple<long,M>> outgoing;
   vector<tuple<long,M>> out_msgs;
-  for ( auto &v: vertices )
+  for ( auto &v: vertices ) {
     v.value = initialize(v.id);
-  for ( auto &e: edges )
-    e.message = zero;
+    v.message = zero;
+  }
   double time = MPI_Wtime();
   double total_time = time;
   int step = 1;
@@ -403,7 +403,7 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
     // send outgoing messages to other ranks
     long index = -1;
     int p = 0;  // partition index
-    long next = (num_of_partitions == 1) ? INT_MAX : partitions[1];
+    long next = partitions[1];
     M m;
     for ( auto t: outgoing ) {
       if (index < 0) {
@@ -447,7 +447,7 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
               send_data(i,buffer,size,0);
             delete[] buffer;
           }
-          next = (p+1 == num_of_partitions) ? INT_MAX : partitions[p+1];
+          next = partitions[p+1];
         }
       }
     }
@@ -505,17 +505,21 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
 template< typename ID, typename V, typename E, typename M >
 void GraphPartition<ID,V,E,M>::collect ( function<void(ID,V)> f ) {
   const int coordinator = 0;
-  size_t buffer_size = sizeof(size_t)+total_num_of_vertices*sizeof(vertex_t);
   if (executor_rank == coordinator) {
     vector<vertex_t> in_vertices;
     for ( auto &v: vertices )
       f(v.id,v.value);
+    size_t max_vertex_size = 0;
+    for ( int i = 0; i < num_of_partitions; i++ )
+      if (i != current_partition)
+        max_vertex_size = max(max_vertex_size,partition_vertices[i]);
+    size_t buffer_size = sizeof(size_t)+max_vertex_size*sizeof(vertex_t);
     char* buffer = new char[buffer_size];
     for ( int i = 1; i < num_of_executors; i++ ) {
       in_vertices.clear();
       receive_data(buffer,buffer_size);
       deserialize(in_vertices,buffer,buffer_size);
-      for ( auto &v: in_vertices )
+      for ( auto v: in_vertices )
         f(v.id,v.value);
     }
     delete[] buffer;

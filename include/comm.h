@@ -20,8 +20,8 @@ extern int executor_rank;
 // send data to an MPI executor
 void send_data ( int rank, char* buffer, size_t len, int tag );
 
-// broadcast data to all executors
-void bcast_data ( char* buffer, size_t len );
+// broadcast data from rank to all executors
+void bcast_data ( int rank, char* buffer, size_t len );
 
 // receive data from rank
 int receive_data ( char* buffer, const size_t buffer_size, int rank );
@@ -30,6 +30,9 @@ int receive_data ( char* buffer, const size_t buffer_size );
 
 // or-together all values (blocking)
 bool or_all ( bool b );
+
+// get max of all values (blocking)
+size_t max_all ( size_t n );
 
 // barrier synchronization
 void barrier ();

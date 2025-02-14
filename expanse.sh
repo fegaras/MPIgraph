@@ -17,7 +17,6 @@ mpic++ -O2 -std=c++11 -DNDEBUG -Iinclude src/main/cpp/*.cpp -o pregel
 ulimit -l unlimited
 ulimit -s unlimited
 
-SOCKETS=2
+cores=32
 
-# for each expanse node: 2 sockets, 1 executor per socket, 64 threads per executor
-mpirun -N $SOCKETS --bind-to socket pregel 1000000000 10
+mpirun -N $cores --bind-to socket pregel 100000000 10

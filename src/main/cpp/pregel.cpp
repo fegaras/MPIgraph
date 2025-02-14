@@ -31,26 +31,34 @@ public:
 
   PageRank ( long num_of_vertices ): GraphPartition() {
     this->num_of_vertices = num_of_vertices;
+    // the zero value of merge
+    zero = 0.0;
   }
 
+  // initialize a vertex
   float initialize ( long id ) {
-    return 1.0/num_of_vertices;
+    return 0.1;   // or   1.0/num_of_vertices;
   }
 
-  float zero = 0.0;
-
+  // merge messages
   float merge ( float x, float y ) {
     return x+y;
   }
 
+  // calculate a new vertex value from the current vertex value
+  //  and from the merged messages
   float new_value ( float val, float acc ) {
     return (1.0-damping_factor)/num_of_vertices + damping_factor*acc;
   }
 
+  // calculate the message value to send to the edge destination;
+  //   new_val is the new vertex value of the edge source;
+  //   degree is the number of out-neighbors
   float send ( float new_val, char edge_val, int degree ) {
     return new_val/degree;
   }
 
+  // if true, activate this vertex at the next superstep
   bool activate ( float new_val, float old_val ) {
     return abs(new_val-old_val)/new_val >= 0.1;
   }
@@ -106,17 +114,21 @@ bool cmp_values ( tuple<long,float> x, tuple<long,float> y ) {
 }
 
 int main ( int argc, char* argv[] ) {
-  // vertices per partition
   long size = (argc > 1) ? atol(argv[1]) : 1000;
   start_comm(argc,argv);
   if (size <= 1) {
     cerr << "A graph should have more than one edge\n";
-    abort_comm();
+    end_comm();
+    exit(-1);
   }
   int max_iterations = (argc > 2) ? atoi(argv[2]) : 1;
   pagerank = new PageRank(size);
-  if (false) test_graph(); else
-  generate_random_graph_partition(executor_rank*ceil(size/num_of_executors),
+  if (false) {
+    // test a small graph
+    size = 11;
+    test_graph();
+  } else
+    generate_random_graph_partition(executor_rank*ceil(size/num_of_executors),
            (executor_rank == num_of_executors-1)
             ? size - ceil(size/num_of_executors)*(num_of_executors-1)
             : ceil(size/num_of_executors),

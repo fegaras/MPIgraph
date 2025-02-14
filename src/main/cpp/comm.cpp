@@ -35,10 +35,10 @@ void send_data ( int rank, char* buffer, size_t len, int tag ) {
            executor_rank,len,rank);
 }
 
-// broadcast data to all executors
-void bcast_data ( char* buffer, const size_t buffer_size ) {
-  MPI_Bcast(buffer,buffer_size,MPI_BYTE,executor_rank,comm);
-  if (trace)
+// broadcast data from rank to all executors
+void bcast_data ( int rank, char* buffer, const size_t buffer_size ) {
+  MPI_Bcast(buffer,buffer_size,MPI_BYTE,rank,comm);
+  if (trace && rank == executor_rank)
     printf("Executor %d: broadcast %ld bytes\n",
            executor_rank,buffer_size);
 }
@@ -67,6 +67,14 @@ bool or_all ( bool b ) {
   int ret[1];
   MPI_Allreduce(in,ret,1,MPI_INT,MPI_LOR,comm);
   return ret[0] == 1;
+}
+
+// get max of all values (blocking)
+size_t max_all ( size_t n ) {
+  long in[1] = { (long)n };
+  long ret;
+  MPI_Allreduce(in,&ret,1,MPI_LONG,MPI_MAX,comm);
+  return ret;
 }
 
 // barrier synchronization
