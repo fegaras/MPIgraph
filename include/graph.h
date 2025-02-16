@@ -61,7 +61,8 @@ private:
   // # of vertices in each partition
   vector<size_t> partition_vertices;
 
-  long total_num_of_vertices;
+  size_t total_num_of_vertices;
+  size_t max_num_of_vertices;
 
   typedef struct {
     ID id;            // vertex id
@@ -320,6 +321,10 @@ void GraphPartition<ID,V,E,M>::build_graph () {
     partitions[++i] = n;
   }
   total_num_of_vertices = n;
+  max_num_of_vertices = 0;
+  for ( int i = 0; i < num_of_partitions; i++ )
+    if (i != current_partition)
+      max_num_of_vertices = max(max_num_of_vertices,partition_vertices[i]);
   // store edges using indices (offsets) for destination
   for ( auto &te: *tmp_edges ) {
     edge_t e;
@@ -382,7 +387,7 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
     thread in_thread(
        [&]()->void {
          vector<tuple<long,M>> in_msgs;
-         size_t buffer_size = sizeof(size_t)+total_num_of_vertices*sizeof(tuple<long,M>);
+         size_t buffer_size = sizeof(size_t)+max_num_of_vertices*sizeof(tuple<long,M>);
          char* buffer = new char[buffer_size];
          for ( int i = 1; i < num_of_partitions; i++ ) {
            in_msgs.clear();
@@ -490,7 +495,8 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
     bool active = false;
     for ( auto v: vertices )
       active = active || v.active;
-    if (!or_all(active)) {  // barrier synchronization
+    // barrier synchronization
+    if (!or_all(active)) {
       step++;
       break;
     }
@@ -509,24 +515,20 @@ void GraphPartition<ID,V,E,M>::collect ( function<void(ID,V)> f ) {
     vector<vertex_t> in_vertices;
     for ( auto &v: vertices )
       f(v.id,v.value);
-    size_t max_vertex_size = 0;
-    for ( int i = 0; i < num_of_partitions; i++ )
-      if (i != current_partition)
-        max_vertex_size = max(max_vertex_size,partition_vertices[i]);
-    size_t buffer_size = sizeof(size_t)+max_vertex_size*sizeof(vertex_t);
+    size_t buffer_size = sizeof(size_t)+max_num_of_vertices*sizeof(vertex_t);
     char* buffer = new char[buffer_size];
     for ( int i = 1; i < num_of_executors; i++ ) {
       in_vertices.clear();
       receive_data(buffer,buffer_size);
       deserialize(in_vertices,buffer,buffer_size);
-      for ( auto v: in_vertices )
+      for ( auto &v: in_vertices )
         f(v.id,v.value);
     }
     delete[] buffer;
   } else {
     char* buffer;
-    size_t size = serialize(vertices,buffer);
-    send_data(0,buffer,size,0);
+    size_t buffer_size = serialize(vertices,buffer);
+    send_data(coordinator,buffer,buffer_size,0);
     delete[] buffer;
   }
   barrier();

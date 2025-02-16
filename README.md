@@ -23,7 +23,7 @@ Compile MPIgraph using:
 make
 ```
 
-You can test Pregel by running Pagerank on a random graph of 1000 vertices using two executors and 10 steps using:
+You can test Pregel by running PageRank on a random graph of 1000 vertices using two executors and 5 steps using:
 ```bash
-n=2 ./run 1000 10
+n=2 ./run 1000 5
 ```
