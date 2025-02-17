@@ -37,7 +37,7 @@ public:
 
   // initialize a vertex
   float initialize ( long id ) {
-    return 0.1;   // or   1.0/num_of_vertices;
+    return 0.05;
   }
 
   // merge messages
@@ -110,7 +110,7 @@ void generate_random_graph_partition ( long start, long size, long total_size ) 
 }
 
 bool cmp_values ( tuple<long,float> x, tuple<long,float> y ) {
-  return get<1>(x) >= get<1>(y);
+  return get<1>(x) <= get<1>(y);
 }
 
 int main ( int argc, char* argv[] ) {
@@ -136,24 +136,20 @@ int main ( int argc, char* argv[] ) {
   // doesn't need this: pagerank->partition([&](long x)->int{ return x%num_of_executors; });
   pagerank->build_graph();
   pagerank->pregel(max_iterations);
-  // collect and print the topk pageranks
+  // collect the topk pageranks
   const int k = 10;
   set<tuple<long,float>,bool(*)(tuple<long,float>,tuple<long,float>)> topk(cmp_values);
-  pagerank->collect(
+  pagerank->foreach(
      [&](long id,float v) {
-       auto t = tuple<long,float>(id,v);
-       topk.insert(t);
-       if (topk.size() == k) {
-         auto it = topk.begin();
-         for ( int i = 1; i < k; i++ )
-           it++;
-         topk.erase(it);
-       }
+       topk.insert(tuple<long,float>(id,v));
+       if (topk.size() > k)
+         // remove the smallest
+         topk.erase(topk.begin());
      });
   if (executor_rank == 0) {
     printf("Top-%d pageranks:\n",k);
-    for ( auto t: topk )
-      printf("%10ld\t%0.8f\n",get<0>(t),get<1>(t));
+    for ( auto it = topk.rbegin(); it != topk.rend(); it++ )
+      printf("%10ld\t%0.8f\n",get<0>(*it),get<1>(*it));
   }
   end_comm();
   return 0;

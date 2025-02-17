@@ -164,8 +164,8 @@ public:
   // Pregel graph processing
   void pregel ( int max_iterations );
 
-  // brink the vertices at the coordinator and apply f to each vertex 
-  void collect ( function<void(ID,V)> f );
+  // iterate over vertices and apply f to each vertex at the coordinator
+  void foreach ( function<void(ID,V)> f );
 };
 
 // get the index of a vertex id
@@ -509,7 +509,7 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
 
 // iterate over vertices and apply f to each vertex at the coordinator
 template< typename ID, typename V, typename E, typename M >
-void GraphPartition<ID,V,E,M>::collect ( function<void(ID,V)> f ) {
+void GraphPartition<ID,V,E,M>::foreach ( function<void(ID,V)> f ) {
   const int coordinator = 0;
   if (executor_rank == coordinator) {
     vector<vertex_t> in_vertices;
