@@ -64,6 +64,9 @@ private:
   size_t total_num_of_vertices;
   size_t max_num_of_vertices;
 
+  // message send to all vertices
+  M global;
+
   typedef struct {
     ID id;            // vertex id
     V value;          // vertex value
@@ -157,6 +160,9 @@ public:
   //   new_val is the new vertex value of the edge source;
   //   degree is the number of out-neighbors
   virtual M send ( V new_val, E edge_val, int degree ) = 0;
+
+  // calculate the message value to send to all vertices (return zero to ignore)
+  virtual M send_all ( V new_val, int degree ) = 0;
 
   // if true, activate this vertex at the next superstep
   virtual bool activate ( V old_val, V new_val ) = 0;
@@ -353,6 +359,7 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
     v.value = initialize(v.id);
     v.message = zero;
   }
+  global = zero;
   double time = MPI_Wtime();
   double total_time = time;
   int step = 1;
@@ -367,6 +374,7 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
       auto &v = vertices[i];
       v.active = false;
       long n = (i+1 == vertices.size()) ? edges.size() : vertices[i+1].first_edge;
+      global = merge(global,send_all(v.value,n-v.first_edge));
       for ( long j = v.first_edge; j < n; j++ ) {
         edges[j].message = merge(edges[j].message,
                                  send(v.value,edges[j].value,n-v.first_edge));
@@ -395,13 +403,18 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
            // store the incoming messages from rank in in_msgs
            deserialize(in_msgs,buffer,buffer_size);
            // update the vertex message from incomming messages
-           for ( auto &m: in_msgs ) {
-             auto &v = vertices[get<0>(m)-partitions[current_partition]];
-             v.message = merge(v.message,get<1>(m));
-             v.active = true;
-             info("received and merged on vertex %ld a message %0.3f",
-                  v.id,v.message);
-           }
+           for ( auto &m: in_msgs )
+	     if (get<0>(m) < 0) {
+	       // received a send_all message
+               for ( int i = 0; i < vertices.size(); i++ )
+                 vertices[i].message = merge(vertices[i].message,get<1>(m));
+	     } else {
+	       auto &v = vertices[get<0>(m)-partitions[current_partition]];
+	       v.message = merge(v.message,get<1>(m));
+	       v.active = true;
+	       info("received and merged on vertex %ld a message %0.3f",
+		    v.id,v.message);
+	     }
          }
          delete[] buffer;
        });
@@ -433,7 +446,16 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
         index = get<0>(t);
         m = get<1>(t);
         if (index >= next) {
-          if (p != current_partition) {
+	  // end of partition p
+          if (p == current_partition) {
+	    // merge global message
+	    if (global != zero)
+	      for ( int i = 0; i < vertices.size(); i++ )
+		vertices[i].message = merge(vertices[i].message,global);
+	  } else {
+	    if (global != zero)
+	      // send also the global message
+	      out_msgs.push_back(tuple<long,M>(-1,global));
             char* buffer;
             size_t size = serialize(out_msgs,buffer);
             send_data(p,buffer,size,0);
@@ -445,11 +467,15 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
             if (index >= partitions[i])
               p = i;
           if (old_p+1 < p) {
-            // send empty vector
+	    out_msgs.clear();
+	    // send the global message only
+	    if (global != zero)
+	      out_msgs.push_back(tuple<long,M>(-1,global));
             char* buffer;
             size_t size = serialize(out_msgs,buffer);
             for ( int i = old_p+1; i < p; i++ )
               send_data(i,buffer,size,0);
+	    out_msgs.clear();
             delete[] buffer;
           }
           next = partitions[p+1];
@@ -462,18 +488,27 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
         info("updating the message of vertex %ld to %0.3f",v.id,m);
         v.active = true;
         v.message = merge(m,v.message);
+	if (global != zero)
+	  for ( int i = 0; i < vertices.size(); i++ )
+	    vertices[i].message = merge(vertices[i].message,global);
       } else {
         info("outgoing message to vertex %ld at rank %d: %0.3f",
              get_id(index),p,m);
         out_msgs.push_back(tuple<long,M>(index,m));
+	if (global != zero)
+	  // send also the global message
+	  out_msgs.push_back(tuple<long,M>(-1,global));
         char* buffer;
         size_t size = serialize(out_msgs,buffer);
         send_data(p,buffer,size,0);
         out_msgs.clear();
-        // send empty vector to remaining ranks
+	// send the global message only
+	if (global != zero)
+	  out_msgs.push_back(tuple<long,M>(-1,global));
         size = serialize(out_msgs,buffer);
         for ( int i = p+1; i < num_of_partitions; i++ )
           send_data(i,buffer,size,0);
+	out_msgs.clear();
         delete[] buffer;
       }
     }
@@ -500,6 +535,7 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
       step++;
       break;
     }
+    global = zero;
     time = MPI_Wtime();
   }
   if (executor_rank == 0)

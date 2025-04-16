@@ -58,6 +58,12 @@ public:
     return new_val/degree;
   }
 
+  // calculate the message value to send to all vertices (return zero to ignore)
+  virtual float send_all ( float new_val, int degree ) {
+    // if this is a sink, do a random jump
+    return (degree == 0) ? new_val/num_of_vertices : zero;
+  }
+
   // if true, activate this vertex at the next superstep
   bool activate ( float new_val, float old_val ) {
     return abs(new_val-old_val)/new_val >= 0.1;
