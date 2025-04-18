@@ -39,7 +39,7 @@ using namespace std;
 
 /* A graph partition of an executor. A partition is associated with a set of vertices 
    that do not overlap with the vertices in other partitions. It also contains all
-   edges whose source is one of these vertices.
+   edges whose source is one of these vertices and all sinks from these vertices.
    ID: the type of a vertex id
    V: the type of a vertex value
    E: the type of an edge value
@@ -93,13 +93,15 @@ private:
   vector<tuple<ID,ID,E>>* tmp_edges;
 
   // get the index of a vertex id
-  long id_loc ( ID id );
+  long id_loc ( ID id ) const;
 
   // get the vertex id at index loc
-  ID get_id ( long loc );
+  ID get_id ( long loc ) const;
+
+  void send_global_only ( M global, int from_rank, int to_rank ) const;
 
   // print tracing info
-  void info_ ( const char* fmt, ... ) {
+  void info_ ( const char* fmt, ... ) const {
     static mutex info_mutex;
     if (trace) {
       lock_guard<mutex> lock(info_mutex);
@@ -137,6 +139,10 @@ public:
     tmp_sinks->push_back(vertex);
   }
 
+  inline size_t num_of_vertices () const {
+    return total_num_of_vertices;
+  }
+
   // redistribute edges and sinks based on the hash function
   void partition ( function<int(ID)> hash );
 
@@ -144,28 +150,28 @@ public:
   void build_graph ();
 
   // initialize a vertex
-  virtual V initialize ( ID id ) = 0;
+  virtual V initialize ( ID id ) const = 0;
 
   // the zero value of merge
   M zero;
 
   // merge messages
-  virtual M merge ( M x, M y ) = 0;
+  virtual M merge ( M x, M y ) const = 0;
 
   // calculate a new vertex value from the current vertex value
   //  and from the merged messages
-  virtual V new_value ( V val, M acc ) = 0;
+  virtual V new_value ( V val, M acc ) const = 0;
 
   // calculate the message value to send to the edge destination;
   //   new_val is the new vertex value of the edge source;
   //   degree is the number of out-neighbors
-  virtual M send ( V new_val, E edge_val, int degree ) = 0;
+  virtual M send ( V new_val, E edge_val, int degree ) const = 0;
 
   // calculate the message value to send to all vertices (return zero to ignore)
-  virtual M send_all ( V new_val, int degree ) = 0;
+  virtual M send_all ( V new_val, int degree ) const = 0;
 
   // if true, activate this vertex at the next superstep
-  virtual bool activate ( V old_val, V new_val ) = 0;
+  virtual bool activate ( V old_val, V new_val ) const = 0;
 
   // Pregel graph processing
   void pregel ( int max_iterations );
@@ -176,7 +182,7 @@ public:
 
 // get the index of a vertex id
 template< typename ID, typename V, typename E, typename M >
-long GraphPartition<ID,V,E,M>::id_loc ( ID id ) {
+long GraphPartition<ID,V,E,M>::id_loc ( ID id ) const {
   for ( int i = 0; i < num_of_partitions; i++ ) {
     auto first = (*tmp_vertices)[i].begin();
     auto last = (*tmp_vertices)[i].end();
@@ -189,7 +195,7 @@ long GraphPartition<ID,V,E,M>::id_loc ( ID id ) {
 
 // get the vertex id at index loc
 template< typename ID, typename V, typename E, typename M >
-ID GraphPartition<ID,V,E,M>::get_id ( long loc ) {
+ID GraphPartition<ID,V,E,M>::get_id ( long loc ) const {
   for ( int i = 0; i < num_of_partitions; i++ )
     if (loc < partitions[i])
       return (*tmp_vertices)[i-1][loc-partitions[i-1]];
@@ -197,34 +203,48 @@ ID GraphPartition<ID,V,E,M>::get_id ( long loc ) {
                 [loc-partitions[num_of_partitions-1]];
 }
 
-// redistribute edges and sinks based on the hash function
+template< typename ID, typename V, typename E, typename M >
+void GraphPartition<ID,V,E,M>::send_global_only
+                 ( M global, int from_rank, int to_rank ) const {
+  if (from_rank < to_rank) {
+    vector<tuple<long,M>> out_msgs;
+    if (global != zero)
+      out_msgs.push_back(tuple<long,M>(-1,global));
+    char* buffer;
+    size_t size = serialize(out_msgs,buffer);
+    for ( int i = from_rank; i < to_rank; i++ )
+      if (i != current_partition) {
+        info("sending an empty vector to node %d",i);
+        send_data(i,buffer,size,0);
+      }
+    out_msgs.clear();
+    delete[] buffer;
+  }
+}
+
+// distribute edges based on the hash function and find sinks
 template< typename ID, typename V, typename E, typename M >
 void GraphPartition<ID,V,E,M>::partition ( function<int(ID)> hash ) {
   double time = MPI_Wtime();
-  vector<vector<ID>> out_sinks;
+  vector<vector<ID>> out_destinations;
   vector<vector<tuple<ID,ID,E>>> out_edges;
   long num_of_edges = tmp_edges->size();
   for ( int i = 0; i < num_of_partitions; i++ ) {
-    out_sinks.push_back(vector<ID>());
+    out_destinations.push_back(vector<ID>());
     out_edges.push_back(vector<tuple<ID,ID,E>>());
-  }
-  while (!tmp_sinks->empty()) {
-    auto id = tmp_sinks->back();
-    tmp_sinks->pop_back();
-    out_sinks[abs(hash(id))%num_of_partitions].push_back(id);
   }
   while (!tmp_edges->empty()) {
     auto t = tmp_edges->back();
     tmp_edges->pop_back();
     out_edges[abs(hash(get<0>(t)))%num_of_partitions].push_back(t);
+    out_destinations[abs(hash(get<1>(t)))%num_of_partitions].push_back(get<1>(t));
   }
-  delete tmp_sinks; delete tmp_edges;
-  tmp_sinks = new vector<ID>(out_sinks[current_partition]);
+  delete tmp_edges;
   tmp_edges = new vector<tuple<ID,ID,E>>(out_edges[current_partition]);
   size_t max_size = 0;
   for ( int i = 0; i < num_of_partitions; i++ )
     if (i != current_partition)
-      max_size = max(max_size,max(out_edges[i].size(),out_sinks[i].size()));
+      max_size = max(max_size,max(out_edges[i].size(),out_destinations[i].size()));
   max_size = max_all(max_size);
   thread trcv(
       [&]()->void {
@@ -232,7 +252,7 @@ void GraphPartition<ID,V,E,M>::partition ( function<int(ID)> hash ) {
         char* buffer = new char[buffer_size];
         for ( int i = 1; i < num_of_partitions; i++ ) {
           receive_data(buffer,buffer_size);
-          deserialize(*tmp_sinks,buffer,buffer_size);
+          deserialize(out_destinations[current_partition],buffer,buffer_size);
         }
         for ( int i = 1; i < num_of_partitions; i++ ) {
           receive_data(buffer,buffer_size);
@@ -243,7 +263,7 @@ void GraphPartition<ID,V,E,M>::partition ( function<int(ID)> hash ) {
   char* buffer;
   for ( int i = 0; i < num_of_partitions; i++ )
     if (i != current_partition) {
-      size_t size = serialize(out_sinks[i],buffer);
+      size_t size = serialize(out_destinations[i],buffer);
       send_data(i,buffer,size,0);
       delete[] buffer;
     }
@@ -255,20 +275,34 @@ void GraphPartition<ID,V,E,M>::partition ( function<int(ID)> hash ) {
       delete[] buffer;
     }
   trcv.join();
-  if (executor_rank == 0)
-    printf("Graph partition time = %.3f secs\n",MPI_Wtime()-time);
-}
-
-// build the graph partition from the edges and the sinks
-template< typename ID, typename V, typename E, typename M >
-void GraphPartition<ID,V,E,M>::build_graph () {
-  double time = MPI_Wtime();
-  // build the local graph partition from the tmp vectors
+  tmp_sinks = new vector<ID>();
+  auto ds = out_destinations[current_partition];
+  sort(ds.begin(),ds.end());
+  ds.erase(unique(ds.begin(),ds.end()),ds.end());
   sort(tmp_edges->begin(),tmp_edges->end(),
        [&](tuple<ID,ID,E> x,tuple<ID,ID,E> y)->bool {
            return get<0>(x) < get<0>(y);
        });
-  sort(tmp_sinks->begin(),tmp_sinks->end());
+  auto t = tuple<ID,ID,E>();
+  for ( auto &d: ds ) {
+    get<0>(t) = d;
+    if (!binary_search(tmp_edges->begin(),tmp_edges->end(),t,
+		       [&](tuple<ID,ID,E> x,tuple<ID,ID,E> y)->bool {
+			 return get<0>(x) < get<0>(y);
+		       }))
+      tmp_sinks->push_back(d);
+  }
+  printf("Executor %d: sinks=%ld, edges=%ld\n",
+         executor_rank,tmp_sinks->size(),tmp_edges->size());
+  barrier();
+  if (executor_rank == 0)
+    printf("Graph partition time = %.3f secs\n",MPI_Wtime()-time);
+}
+
+// build the graph partition from the sorted edges and sinks
+template< typename ID, typename V, typename E, typename M >
+void GraphPartition<ID,V,E,M>::build_graph () {
+  double time = MPI_Wtime();
   ID vid;
   long index = 0;
   auto sink_it = tmp_sinks->begin();
@@ -383,7 +417,7 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
       }
     }
     // put outgoing messages into a vector and sort them by the edge destination
-    for ( auto e: edges )
+    for ( auto &e: edges )
       outgoing.push_back(tuple<long,M>(e.destination,e.message));
     sort(outgoing.begin(),outgoing.end(),
          [&](tuple<long,M> &x,tuple<long,M> &y)->bool {
@@ -406,8 +440,8 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
            for ( auto &m: in_msgs )
 	     if (get<0>(m) < 0) {
 	       // received a send_all message
-               for ( int i = 0; i < vertices.size(); i++ )
-                 vertices[i].message = merge(vertices[i].message,get<1>(m));
+	       for ( int i = 0; i < vertices.size(); i++ )
+		 vertices[i].message = merge(vertices[i].message,get<1>(m));
 	     } else {
 	       auto &v = vertices[get<0>(m)-partitions[current_partition]];
 	       v.message = merge(v.message,get<1>(m));
@@ -419,97 +453,98 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
          delete[] buffer;
        });
     // send outgoing messages to other ranks
-    long index = -1;
-    int p = 0;  // partition index
-    long next = partitions[1];
-    M m;
-    for ( auto t: outgoing ) {
-      if (index < 0) {
-        index = get<0>(t);
-        m = get<1>(t);
-        for ( int i = 0; i < num_of_partitions; i++ )
-          if (index >= partitions[i])
-            p = i;
-      } else if (get<0>(t) == index)
-        m = merge(m,get<1>(t));
-      else {
+    if (outgoing.size() == 0) {
+      // nothing to send
+      out_msgs.clear();
+      char* buffer;
+      size_t size = serialize(out_msgs,buffer);
+      for ( int i = 0; i < num_of_partitions; i++ )
+        if (i != current_partition)
+          send_data(i,buffer,size,0);
+      out_msgs.clear();
+      delete[] buffer;
+    } else {
+      long index = -1;  // vertex loc
+      int p = 0;  // partition index
+      long next = partitions[1];
+      M m;
+      for ( auto &t: outgoing ) {
+        if (index < 0) {
+          // at the first edge only
+          index = get<0>(t);
+          m = get<1>(t);
+          for ( int i = 0; i < num_of_partitions; i++ )
+            if (index >= partitions[i])
+              p = i;
+          send_global_only(global,0,p);
+        } else if (get<0>(t) == index) {
+          // merge consecutive messages to the same vertex
+          m = merge(m,get<1>(t));
+        } else {
+          // start processing a new vertex
+          if (p == current_partition) {
+            auto &v = vertices[index-partitions[p]];
+            v.active = true;
+            v.message = merge(m,v.message);
+            info("updating the message of vertex %ld to %0.3f",
+                 v.id,v.message);
+          } else {
+            info("outgoing message to vertex %ld at rank %d: %0.3f",
+                 get_id(index),p,m);
+            out_msgs.push_back(tuple<long,M>(index,m));
+          }
+          index = get<0>(t);
+          m = get<1>(t);
+          if (index >= next) {
+            // end of partition p
+            if (p == current_partition) {
+              // merge global message
+              if (global != zero)
+                for ( int i = 0; i < vertices.size(); i++ ) {
+                  vertices[i].active = true;
+                  vertices[i].message = merge(vertices[i].message,global);
+                }
+            } else {
+              if (global != zero)
+                // send also the global message
+                out_msgs.push_back(tuple<long,M>(-1,global));
+              char* buffer;
+              size_t size = serialize(out_msgs,buffer);
+              send_data(p,buffer,size,0);
+              out_msgs.clear();
+              delete[] buffer;
+            }
+            int old_p = p;
+            for ( int i = p+1; i < num_of_partitions; i++ )
+              if (index >= partitions[i])
+                p = i;
+            send_global_only(global,old_p+1,p);
+            next = partitions[p+1];
+          }
+        }
+      }
+      { // same for last partition
+        auto &v = vertices[index-partitions[p]];
         if (p == current_partition) {
-          auto &v = vertices[index-partitions[p]];
           info("updating the message of vertex %ld to %0.3f",v.id,m);
           v.active = true;
           v.message = merge(m,v.message);
+          if (global != zero)
+            for ( int i = 0; i < vertices.size(); i++ )
+              vertices[i].message = merge(vertices[i].message,global);
         } else {
           info("outgoing message to vertex %ld at rank %d: %0.3f",
                get_id(index),p,m);
           out_msgs.push_back(tuple<long,M>(index,m));
+          if (global != zero)
+            // send also the global message
+            out_msgs.push_back(tuple<long,M>(-1,global));
+          char* buffer;
+          size_t size = serialize(out_msgs,buffer);
+          send_data(p,buffer,size,0);
+          out_msgs.clear();
         }
-        index = get<0>(t);
-        m = get<1>(t);
-        if (index >= next) {
-	  // end of partition p
-          if (p == current_partition) {
-	    // merge global message
-	    if (global != zero)
-	      for ( int i = 0; i < vertices.size(); i++ )
-		vertices[i].message = merge(vertices[i].message,global);
-	  } else {
-	    if (global != zero)
-	      // send also the global message
-	      out_msgs.push_back(tuple<long,M>(-1,global));
-            char* buffer;
-            size_t size = serialize(out_msgs,buffer);
-            send_data(p,buffer,size,0);
-            out_msgs.clear();
-            delete[] buffer;
-          }
-          int old_p = p;
-          for ( int i = p+1; i < num_of_partitions; i++ )
-            if (index >= partitions[i])
-              p = i;
-          if (old_p+1 < p) {
-	    out_msgs.clear();
-	    // send the global message only
-	    if (global != zero)
-	      out_msgs.push_back(tuple<long,M>(-1,global));
-            char* buffer;
-            size_t size = serialize(out_msgs,buffer);
-            for ( int i = old_p+1; i < p; i++ )
-              send_data(i,buffer,size,0);
-	    out_msgs.clear();
-            delete[] buffer;
-          }
-          next = partitions[p+1];
-        }
-      }
-    }
-    { // same for last partition
-      auto &v = vertices[index-partitions[p]];
-      if (p == current_partition) {
-        info("updating the message of vertex %ld to %0.3f",v.id,m);
-        v.active = true;
-        v.message = merge(m,v.message);
-	if (global != zero)
-	  for ( int i = 0; i < vertices.size(); i++ )
-	    vertices[i].message = merge(vertices[i].message,global);
-      } else {
-        info("outgoing message to vertex %ld at rank %d: %0.3f",
-             get_id(index),p,m);
-        out_msgs.push_back(tuple<long,M>(index,m));
-	if (global != zero)
-	  // send also the global message
-	  out_msgs.push_back(tuple<long,M>(-1,global));
-        char* buffer;
-        size_t size = serialize(out_msgs,buffer);
-        send_data(p,buffer,size,0);
-        out_msgs.clear();
-	// send the global message only
-	if (global != zero)
-	  out_msgs.push_back(tuple<long,M>(-1,global));
-        size = serialize(out_msgs,buffer);
-        for ( int i = p+1; i < num_of_partitions; i++ )
-          send_data(i,buffer,size,0);
-	out_msgs.clear();
-        delete[] buffer;
+        send_global_only(global,p+1,num_of_partitions);
       }
     }
     in_thread.join();
@@ -528,7 +563,7 @@ void GraphPartition<ID,V,E,M>::pregel ( int max_iterations ) {
     if (executor_rank == 0)
       printf("Step %d took %.3f secs\n",step,MPI_Wtime()-time);
     bool active = false;
-    for ( auto v: vertices )
+    for ( auto &v: vertices )
       active = active || v.active;
     // barrier synchronization
     if (!or_all(active)) {

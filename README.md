@@ -27,3 +27,7 @@ You can test Pregel by running PageRank on a random graph of 1000 vertices using
 ```bash
 n=2 ./run 1000 5
 ```
+or on the [https://snap.stanford.edu/data/web-Google.html](Google web graph) using:
+```bash
+n=2 ./run web-Google.txt 5
+```
